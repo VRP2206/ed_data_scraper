@@ -41,12 +41,19 @@ from typing import Any
 
 import requests
 
+# Load .env if present
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    for _line in _env_path.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 
 # ============================================================
 # Configuration
 # ============================================================
-
-COURSE_ID = 37082
 
 # Per Ed's own API docs: "Your current API server is
 # https://edstem.org/api" -- NOT a per-region subdomain.
@@ -54,9 +61,6 @@ BASE_URL = "https://edstem.org/api"
 
 # Threads-per-request when listing (API max is 100).
 LIST_PAGE_SIZE = 100
-
-OUTPUT_DIR = Path(f"ed_{COURSE_ID}")
-THREADS_DIR = OUTPUT_DIR / "threads"
 
 REQUEST_DELAY = 0.15
 REQUEST_TIMEOUT = 30
@@ -156,22 +160,17 @@ class EdClient:
 # ============================================================
 
 def get_token() -> str:
-    token = os.environ.get("ED_TOKEN")
+    token = os.environ.get("ED_TOKEN", "").strip()
 
     if not token:
-        print(
-            "\nED_TOKEN is not set.\n\n"
-            "PowerShell:\n"
-            '    $env:ED_TOKEN="YOUR_TOKEN_HERE"\n\n'
-            "CMD:\n"
-            "    set ED_TOKEN=YOUR_TOKEN_HERE\n\n"
-            "Linux/macOS:\n"
-            '    export ED_TOKEN="YOUR_TOKEN_HERE"\n',
-            file=sys.stderr,
-        )
+        import getpass
+        token = getpass.getpass("Ed API token: ").strip()
+
+    if not token:
+        print("No token provided. Exiting.", file=sys.stderr)
         sys.exit(1)
 
-    return token.strip()
+    return token
 
 
 def safe_filename(name: str, max_length: int = 100) -> str:
@@ -505,15 +504,15 @@ def thread_to_markdown(thread: dict, number: int) -> str:
 # Thread discovery (paginated via limit/offset, per Ed's API)
 # ============================================================
 
-def get_all_threads(client: EdClient) -> list[dict]:
-    print(f"\nGetting threads for course {COURSE_ID}...")
+def get_all_threads(client: EdClient, course_id: int) -> list[dict]:
+    print(f"\nGetting threads for course {course_id}...")
 
     all_threads: list[dict] = []
     offset = 0
 
     while True:
         endpoint = (
-            f"/courses/{COURSE_ID}/threads"
+            f"/courses/{course_id}/threads"
             f"?limit={LIST_PAGE_SIZE}&offset={offset}&sort=new"
         )
 
@@ -578,13 +577,13 @@ def get_thread_details(client: EdClient, thread: dict) -> dict:
 # Export
 # ============================================================
 
-def save_json(threads: list[dict]):
-    path = OUTPUT_DIR / "all_posts.json"
+def save_json(threads: list[dict], output_dir: Path, course_id: int):
+    path = output_dir / "all_posts.json"
 
     with path.open("w", encoding="utf-8") as f:
         json.dump(
             {
-                "course_id": COURSE_ID,
+                "course_id": course_id,
                 "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "thread_count": len(threads),
                 "threads": threads,
@@ -597,11 +596,11 @@ def save_json(threads: list[dict]):
     print(f"Saved JSON: {path}")
 
 
-def save_markdown(threads: list[dict]):
-    path = OUTPUT_DIR / "all_posts.md"
+def save_markdown(threads: list[dict], output_dir: Path, course_id: int):
+    path = output_dir / "all_posts.md"
 
     with path.open("w", encoding="utf-8") as f:
-        f.write(f"# Ed Discussion Course {COURSE_ID}\n\n")
+        f.write(f"# Ed Discussion Course {course_id}\n\n")
         f.write(f"Total threads: **{len(threads)}**\n\n")
         f.write("---\n\n")
 
@@ -639,13 +638,14 @@ def save_markdown(threads: list[dict]):
     print(f"Saved Markdown: {path}")
 
 
-def save_individual_threads(threads: list[dict]):
-    THREADS_DIR.mkdir(parents=True, exist_ok=True)
+def save_individual_threads(threads: list[dict], output_dir: Path):
+    threads_dir = output_dir / "threads"
+    threads_dir.mkdir(parents=True, exist_ok=True)
 
     for number, thread in enumerate(threads, start=1):
         title = first_value(thread, "title", "subject", default=f"Thread {number}")
         filename = f"{number:06d}-{safe_filename(title)}.md"
-        path = THREADS_DIR / filename
+        path = threads_dir / filename
         path.write_text(thread_to_markdown(thread, number), encoding="utf-8")
 
     print(f"Saved {len(threads)} individual Markdown files.")
@@ -655,16 +655,39 @@ def save_individual_threads(threads: list[dict]):
 # Main
 # ============================================================
 
-def main():
+def prompt_inputs() -> tuple[int, str]:
     print("=" * 60)
     print("Ed Discussion Exporter")
     print("=" * 60)
-    print(f"Course: {COURSE_ID}")
+    print()
+
+    while True:
+        course_id_str = input("Course ID: ").strip()
+        if course_id_str.isdigit():
+            course_id = int(course_id_str)
+            break
+        print("  Course ID must be a number. Please try again.")
+
+    course_name = input("Course name (used as output folder name): ").strip()
+    if not course_name:
+        course_name = str(course_id)
+
+    return course_id, course_name
+
+
+def main():
+    course_id, course_name = prompt_inputs()
+
+    output_dir = Path("data_obtained") / course_name
+
+    print()
+    print(f"Course ID   : {course_id}")
+    print(f"Output dir  : {output_dir.resolve()}")
     print()
 
     token = get_token()
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     client = EdClient(token)
 
@@ -685,7 +708,7 @@ def main():
         sys.exit(1)
 
     try:
-        threads = get_all_threads(client)
+        threads = get_all_threads(client, course_id)
     except Exception as exc:
         print(f"\nFailed to retrieve threads:\n{exc}", file=sys.stderr)
         sys.exit(1)
@@ -708,9 +731,9 @@ def main():
 
     print("\nSaving files...")
 
-    save_json(full_threads)
-    save_markdown(full_threads)
-    save_individual_threads(full_threads)
+    save_json(full_threads, output_dir, course_id)
+    save_markdown(full_threads, output_dir, course_id)
+    save_individual_threads(full_threads, output_dir)
 
     print()
     print("=" * 60)
@@ -718,12 +741,12 @@ def main():
     print("=" * 60)
     print()
     print("Output directory:")
-    print(f"  {OUTPUT_DIR.resolve()}")
+    print(f"  {output_dir.resolve()}")
     print()
     print("Files:")
-    print(f"  {OUTPUT_DIR / 'all_posts.json'}")
-    print(f"  {OUTPUT_DIR / 'all_posts.md'}")
-    print(f"  {THREADS_DIR}/")
+    print(f"  {output_dir / 'all_posts.json'}")
+    print(f"  {output_dir / 'all_posts.md'}")
+    print(f"  {output_dir / 'threads'}/'")
 
 
 if __name__ == "__main__":
