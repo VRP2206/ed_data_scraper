@@ -2,3 +2,6 @@
 /venv/
 .env
 .idea
+
+# testing available command, GET and POST are avaialable
+probe_api.py
