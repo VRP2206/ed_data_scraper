@@ -23,6 +23,10 @@ pip install requests
 
 Get your API token from Ed Discussion → Account Settings → API Tokens.
 
+Where to get the API key:
+![where_to_get_api.png](./assets/Ed_api-screen_view.png)
+Note: ED API feature is in beta right now. You may have to active it by clicking [Activate API](https://edstem.org/au/settings/api-tokens)
+
 Set it as an environment variable before running:
 
 ```bash
@@ -51,15 +55,15 @@ python export_ed.py
 ```
 
 You will be prompted for:
-- **Course ID** — the numeric ID from the course URL (e.g. `edstem.org/courses/12345`)
-- **Course name** — used as the output folder name
+- **Course ID**: the numeric ID from the course URL (e.g. `edstem.org/courses/12345`)
+- **Course name**: used as the output folder name
 
 ## Notes
 
 - The script respects rate limits and retries on transient server errors.
 - Only courses your account has access to can be exported.
-- Exported data may contain personal information — see [PRIVACY.md](PRIVACY.md).
+- Exported data may contain personal information - see [PRIVACY.md](PRIVACY.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).
