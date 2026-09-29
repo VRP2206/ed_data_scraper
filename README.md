@@ -1,6 +1,6 @@
 # Ed Discussion Exporter
 
-Exports all posts from an [Ed Discussion](https://edstem.org) course to JSON and Markdown files using the Ed API.
+Exports threads and/or Ed Lessons from an [Ed Discussion](https://edstem.org) course to JSON and Markdown files using the Ed API.
 
 ## Output
 
@@ -11,6 +11,11 @@ data_obtained/<course_name>/
     threads/
         000001-<title>.md   # one file per thread
         ...
+    lessons/
+        all_lessons.json    # lessons, modules and full slide content as raw JSON
+        all_lessons.md      # all lessons as a single Markdown file
+        01-<module>/
+            001-<lesson>.md # one file per lesson, slides in order
 ```
 
 ## Setup
@@ -57,11 +62,13 @@ python export_ed.py
 You will be prompted for:
 - **Course ID**: the numeric ID from the course URL (e.g. `edstem.org/courses/12345`)
 - **Course name**: used as the output folder name
+- **What to export**: `1` threads, `2` lessons, or `3` both
 
 ## Notes
 
 - The script respects rate limits and retries on transient server errors.
 - Only courses your account has access to can be exported.
+- Lesson results and activity are staff-only (403), so only lesson content is exported.
 - Exported data may contain personal information - see [PRIVACY.md](PRIVACY.md).
 
 ## License
