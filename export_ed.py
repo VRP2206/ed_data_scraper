@@ -31,11 +31,13 @@ Linux/macOS:
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import re
 import sys
 import time
 import xml.etree.ElementTree as ET
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any
 
@@ -309,8 +311,16 @@ def _render_element(el: ET.Element) -> str:
     if tag == "document":
         return _render_inline(el)
 
-    # Unknown tag: just render its inline content.
-    return _render_inline(el)
+    # Unknown tag: render its inline content, keeping any URL it carries
+    # (lesson slides use tags such as video / iframe / web-snippet).
+    inner = _render_inline(el)
+
+    for attr in ("url", "src", "href"):
+        target = el.get(attr)
+        if target:
+            return f"[{inner.strip() or tag}]({target})\n\n"
+
+    return inner
 
 
 def html_to_markdown(html: Any) -> str:
@@ -652,6 +662,328 @@ def save_individual_threads(threads: list[dict], output_dir: Path):
 
 
 # ============================================================
+# Ed Lessons
+#
+# Endpoints (reverse-engineered, Ed's API is beta):
+#   GET /courses/<id>/lessons   -> {"lessons": [...], "modules": [...]}
+#   GET /lessons/<id>           -> {"lesson": {...}}
+#   GET /lessons/<id>/slides    -> {"slides": [...]}
+#   GET /lessons/slides/<id>    -> {"slide": {...}}
+#
+# Lesson results / activity endpoints return 403 for non-staff
+# accounts, so they are not requested.
+# ============================================================
+
+def get_lessons_index(client: EdClient, course_id: int) -> tuple[list[dict], list[dict]]:
+    print(f"\nGetting lessons for course {course_id}...")
+
+    data = client.get(f"/courses/{course_id}/lessons")
+
+    lessons = data.get("lessons", []) if isinstance(data, dict) else []
+    modules = data.get("modules", []) if isinstance(data, dict) else []
+
+    if not isinstance(lessons, list):
+        lessons = []
+
+    if not isinstance(modules, list):
+        modules = []
+
+    print(f"Found {len(lessons)} lessons in {len(modules)} modules.")
+
+    return lessons, modules
+
+
+def _asset_extension(url: str, content_type: str) -> str:
+    """Choose a useful file extension from the URL or HTTP Content-Type."""
+    path_ext = Path(urlparse(url).path).suffix.lower()
+    allowed = {".html", ".htm", ".pdf", ".txt", ".xml", ".js", ".css", ".json", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".webm"}
+    if path_ext in allowed:
+        return ".html" if path_ext == ".htm" else path_ext
+    mime = content_type.split(";", 1)[0].strip().lower()
+    mapping = {
+        "text/html": ".html", "application/pdf": ".pdf", "text/plain": ".txt",
+        "application/xml": ".xml", "text/xml": ".xml", "application/javascript": ".js",
+        "text/javascript": ".js", "application/json": ".json", "text/css": ".css",
+        "image/svg+xml": ".svg", "image/png": ".png", "image/jpeg": ".jpg",
+        "image/gif": ".gif", "image/webp": ".webp", "video/mp4": ".mp4",
+        "video/webm": ".webm",
+    }
+    return mapping.get(mime, mimetypes.guess_extension(mime) or ".bin")
+
+
+def download_slide_asset(client: EdClient, slide: dict, asset_dir: Path) -> None:
+    """Download a slide's linked resource without assuming it is HTML.
+
+    Ed often exposes only slide metadata and a URL. The URL may point to an
+    HTML/JS lesson, PDF, plain text, XML, or another resource. Save bytes as-is
+    and annotate the slide with a path relative to the lessons output folder.
+    """
+    url = slide.get("url")
+    if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+        return
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        response = client.session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "application/octet-stream")
+        ext = _asset_extension(response.url or url, content_type)
+        slide_id = slide.get("id", "slide")
+        filename = f"{slide_id}{ext}"
+        path = asset_dir / filename
+        path.write_bytes(response.content)
+        slide["downloaded_asset"] = path.name
+        slide["downloaded_content_type"] = content_type
+        slide["downloaded_bytes"] = len(response.content)
+    except Exception as exc:
+        slide["download_error"] = str(exc)
+        print(f"  Warning: couldn't download slide URL {url}: {exc}", file=sys.stderr)
+
+
+def get_lesson_full(client: EdClient, lesson: dict) -> dict:
+    """Fetch lesson detail + every slide's full content."""
+
+    lesson_id = lesson.get("id")
+    detail = dict(lesson)
+
+    try:
+        data = client.get(f"/lessons/{lesson_id}")
+        if isinstance(data, dict) and isinstance(data.get("lesson"), dict):
+            detail.update(data["lesson"])
+    except Exception as exc:
+        print(f"  Warning: couldn't fetch lesson {lesson_id}: {exc}", file=sys.stderr)
+
+    slides: list[dict] = []
+
+    try:
+        data = client.get(f"/lessons/{lesson_id}/slides")
+        if isinstance(data, dict) and isinstance(data.get("slides"), list):
+            slides = data["slides"]
+        elif isinstance(data, list):
+            slides = data
+    except Exception as exc:
+        print(f"  Warning: couldn't fetch slides for lesson {lesson_id}: {exc}", file=sys.stderr)
+
+    if not slides and isinstance(detail.get("slides"), list):
+        slides = detail["slides"]
+
+    full_slides = []
+
+    for slide in slides:
+        slide_id = slide.get("id") if isinstance(slide, dict) else None
+        merged = dict(slide) if isinstance(slide, dict) else {}
+
+        if slide_id is not None:
+            try:
+                data = client.get(f"/lessons/slides/{slide_id}")
+                if isinstance(data, dict) and isinstance(data.get("slide"), dict):
+                    merged.update(data["slide"])
+            except Exception as exc:
+                print(f"  Warning: couldn't fetch slide {slide_id}: {exc}", file=sys.stderr)
+
+        full_slides.append(merged)
+
+    detail["slides"] = full_slides
+
+    return detail
+
+
+def slide_to_markdown(slide: dict, number: int) -> str:
+    title = first_value(slide, "title", "name", default=f"Slide {number}")
+    slide_type = slide.get("type", "")
+
+    lines = [f"## {number}. {title}", ""]
+
+    meta = []
+    if slide_type:
+        meta.append(f"- **Type:** {slide_type}")
+    if slide.get("id") is not None:
+        meta.append(f"- **Slide ID:** {slide['id']}")
+
+    if meta:
+        lines.extend(meta)
+        lines.append("")
+
+    slide_url = slide.get("url")
+    if slide_url:
+        lines.append(f"- **Source URL:** <{slide_url}>")
+        lines.append("")
+
+    if slide.get("downloaded_asset"):
+        asset_path = f"{slide.get('_asset_prefix', '../assets')}/{slide['downloaded_asset']}"
+        lines.append(f"- **Downloaded resource:** [{slide['downloaded_asset']}]({asset_path})")
+        lines.append(f"- **Content type:** {slide.get('downloaded_content_type', 'unknown')}")
+        lines.append("")
+    elif slide.get("download_error"):
+        lines.append(f"- **Download warning:** {slide['download_error']}")
+        lines.append("")
+
+    body = get_body(slide)
+
+    if body:
+        lines.append(body)
+        lines.append("")
+
+    # Quiz / question data: structure isn't documented, so keep it lossless.
+    for key in ("questions", "quiz_questions", "question"):
+        value = slide.get(key)
+
+        if value:
+            lines.append(f"**{key}:**")
+            lines.append("")
+            lines.append("```json")
+            lines.append(json.dumps(value, indent=2, ensure_ascii=False))
+            lines.append("```")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def lesson_to_markdown(lesson: dict, module_name: str, asset_prefix: str = "assets") -> str:
+    title = first_value(lesson, "title", "name", default=f"Lesson {lesson.get('id', '')}")
+
+    lines = [f"# {title}", "", f"- **Lesson ID:** {lesson.get('id', '')}"]
+
+    if module_name:
+        lines.append(f"- **Module:** {module_name}")
+
+    for label, key in (("Status", "state"), ("Type", "type"), ("Created", "created_at")):
+        if lesson.get(key):
+            lines.append(f"- **{label}:** {lesson[key]}")
+
+    slides = lesson.get("slides", [])
+    lines.extend([f"- **Slides:** {len(slides)}", "", "---", ""])
+
+    for number, slide in enumerate(slides, start=1):
+        slide["_asset_prefix"] = asset_prefix
+        lines.append(slide_to_markdown(slide, number))
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def export_lessons(client: EdClient, course_id: int, output_dir: Path) -> bool:
+    lessons, modules = get_lessons_index(client, course_id)
+
+    if not lessons:
+        print("\nNo lessons were returned.")
+        return False
+
+    module_names = {m.get("id"): first_value(m, "name", "title", default="") for m in modules}
+    module_order = {m.get("id"): i for i, m in enumerate(modules, start=1)}
+
+    print(f"\nDownloading full content for {len(lessons)} lessons...")
+
+    full_lessons = []
+
+    for index, lesson in enumerate(lessons, start=1):
+        title = first_value(lesson, "title", "name", default="Untitled")
+        print(f"[{index}/{len(lessons)}] {lesson.get('id')}: {title}")
+        full_lessons.append(get_lesson_full(client, lesson))
+
+    lessons_dir = output_dir / "lessons"
+    lessons_dir.mkdir(parents=True, exist_ok=True)
+
+    # The API often returns slide metadata and a URL, not the actual lesson.
+    # Download the linked resource and preserve its original format.
+    print("\nDownloading linked lesson resources (HTML/JS, PDF, text, XML, etc.)...")
+    for lesson in full_lessons:
+        asset_dir = lessons_dir / "assets" / str(lesson.get("id", "unknown"))
+        for slide in lesson.get("slides", []):
+            download_slide_asset(client, slide, asset_dir)
+            if slide.get("downloaded_asset"):
+                slide["downloaded_asset"] = f"{lesson.get('id', 'unknown')}/{slide['downloaded_asset']}"
+
+    print("\nSaving lesson files...")
+
+    # Raw JSON
+    json_path = lessons_dir / "all_lessons.json"
+
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "course_id": course_id,
+                "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "lesson_count": len(full_lessons),
+                "modules": modules,
+                "lessons": full_lessons,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    print(f"Saved JSON: {json_path}")
+
+    # One Markdown file per lesson, grouped by module; plus a combined file
+    counters: dict = {}
+    combined = [f"# Ed Lessons - Course {course_id}\n", f"Total lessons: **{len(full_lessons)}**\n", "---\n"]
+
+    for lesson in full_lessons:
+        module_id = lesson.get("module_id")
+        module_name = module_names.get(module_id, "")
+
+        if module_id in module_order:
+            folder_name = f"{module_order[module_id]:02d}-{safe_filename(module_name or 'module')}"
+        else:
+            folder_name = "00-no-module"
+
+        folder = lessons_dir / folder_name
+        folder.mkdir(parents=True, exist_ok=True)
+
+        counters[folder_name] = counters.get(folder_name, 0) + 1
+        title = first_value(lesson, "title", "name", default="Untitled")
+        filename = f"{counters[folder_name]:03d}-{safe_filename(title)}.md"
+
+        markdown = lesson_to_markdown(lesson, module_name, asset_prefix="../assets")
+        (folder / filename).write_text(markdown, encoding="utf-8")
+
+        combined_markdown = lesson_to_markdown(lesson, module_name, asset_prefix="assets")
+        combined.append(combined_markdown)
+        combined.append("\n---\n")
+
+    combined_path = lessons_dir / "all_lessons.md"
+    combined_path.write_text("\n".join(combined), encoding="utf-8")
+
+    print(f"Saved Markdown: {combined_path}")
+    print(f"Saved {len(full_lessons)} individual lesson files.")
+
+    return True
+
+
+# ============================================================
+# Threads export (wraps the functions above)
+# ============================================================
+
+def export_threads(client: EdClient, course_id: int, output_dir: Path) -> bool:
+    threads = get_all_threads(client, course_id)
+
+    if not threads:
+        print("\nNo threads were returned.")
+        return False
+
+    print(f"\nDownloading full content for {len(threads)} threads...")
+
+    full_threads = []
+
+    for index, thread in enumerate(threads, start=1):
+        thread_id = first_value(thread, "id", "thread_id", default="?")
+        title = first_value(thread, "title", "subject", default="Untitled")
+
+        print(f"[{index}/{len(threads)}] {thread_id}: {title}")
+
+        full_threads.append(get_thread_details(client, thread))
+
+    print("\nSaving thread files...")
+
+    save_json(full_threads, output_dir, course_id)
+    save_markdown(full_threads, output_dir, course_id)
+    save_individual_threads(full_threads, output_dir)
+
+    return True
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -675,13 +1007,40 @@ def prompt_inputs() -> tuple[int, str]:
     return course_id, course_name
 
 
+def prompt_export_choice() -> tuple[bool, bool]:
+    """Ask what to export. Returns (want_threads, want_lessons)."""
+
+    print()
+    print("What do you want to export?")
+    print("  1) Threads  (discussion posts)")
+    print("  2) Lessons  (Ed Lessons: modules, slides, quizzes)")
+    print("  3) Both")
+    print()
+
+    choices = {
+        "1": (True, False), "threads": (True, False), "thread": (True, False),
+        "2": (False, True), "lessons": (False, True), "lesson": (False, True),
+        "3": (True, True), "both": (True, True),
+    }
+
+    while True:
+        answer = input("Enter 1, 2 or 3: ").strip().lower()
+
+        if answer in choices:
+            return choices[answer]
+
+        print("  Please enter 1 (threads), 2 (lessons) or 3 (both).")
+
+
 def main():
     course_id, course_name = prompt_inputs()
+    want_threads, want_lessons = prompt_export_choice()
 
     output_dir = Path("data_obtained") / course_name
 
     print()
     print(f"Course ID   : {course_id}")
+    print(f"Exporting   : {'threads' if want_threads and not want_lessons else 'lessons' if want_lessons and not want_threads else 'threads + lessons'}")
     print(f"Output dir  : {output_dir.resolve()}")
     print()
 
@@ -707,46 +1066,43 @@ def main():
         print(f"\nCould not authenticate:\n{exc}", file=sys.stderr)
         sys.exit(1)
 
-    try:
-        threads = get_all_threads(client, course_id)
-    except Exception as exc:
-        print(f"\nFailed to retrieve threads:\n{exc}", file=sys.stderr)
-        sys.exit(1)
+    exported = []
+    failed = []
 
-    if not threads:
-        print("\nNo threads were returned.")
-        sys.exit(1)
+    if want_threads:
+        try:
+            if export_threads(client, course_id, output_dir):
+                exported.append("threads")
+        except Exception as exc:
+            print(f"\nFailed to export threads:\n{exc}", file=sys.stderr)
+            failed.append("threads")
 
-    print(f"\nDownloading full content for {len(threads)} threads...")
-
-    full_threads = []
-
-    for index, thread in enumerate(threads, start=1):
-        thread_id = first_value(thread, "id", "thread_id", default="?")
-        title = first_value(thread, "title", "subject", default="Untitled")
-
-        print(f"[{index}/{len(threads)}] {thread_id}: {title}")
-
-        full_threads.append(get_thread_details(client, thread))
-
-    print("\nSaving files...")
-
-    save_json(full_threads, output_dir, course_id)
-    save_markdown(full_threads, output_dir, course_id)
-    save_individual_threads(full_threads, output_dir)
+    if want_lessons:
+        try:
+            if export_lessons(client, course_id, output_dir):
+                exported.append("lessons")
+        except Exception as exc:
+            print(f"\nFailed to export lessons:\n{exc}", file=sys.stderr)
+            failed.append("lessons")
 
     print()
     print("=" * 60)
-    print("EXPORT COMPLETE")
+    print("EXPORT COMPLETE" if exported and not failed else "EXPORT FINISHED WITH ISSUES")
     print("=" * 60)
     print()
-    print("Output directory:")
-    print(f"  {output_dir.resolve()}")
-    print()
-    print("Files:")
-    print(f"  {output_dir / 'all_posts.json'}")
-    print(f"  {output_dir / 'all_posts.md'}")
-    print(f"  {output_dir / 'threads'}/'")
+    print(f"Output directory: {output_dir.resolve()}")
+
+    if "threads" in exported:
+        print(f"  Threads : {output_dir / 'all_posts.json'}, all_posts.md, threads/")
+
+    if "lessons" in exported:
+        print(f"  Lessons : {output_dir / 'lessons'}/ (all_lessons.json, all_lessons.md, <module>/*.md)")
+
+    if failed:
+        print(f"\nFailed: {', '.join(failed)}")
+
+    if not exported:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
